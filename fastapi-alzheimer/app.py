@@ -1,13 +1,16 @@
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import pandas as pd
+import numpy as np
 import mlflow
 import mlflow.xgboost
 import pickle
+import urllib.parse
 
 app = FastAPI(title="Alzheimer Predictor API")
 from fastapi.staticfiles import StaticFiles
+from retrain import handle_new_patient
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -31,7 +34,7 @@ prep_path = mlflow.artifacts.download_artifacts(
 with open(prep_path, "rb") as f:
     transformador = pickle.load(f)
 
-modelo = mlflow.xgboost.load_model("models:/Alzheimer_XGBoost/1")
+modelo = mlflow.xgboost.load_model("models:/Alzheimer_XGBoost/latest")
 
 
 
@@ -152,11 +155,65 @@ async def predict(request: Request,
     data = build_features(data)
 
     X = transformador.transform(data)
+    X_list = X.tolist()[0]
 
-    pred = modelo.predict(X)[0]
+    proba = modelo.predict_proba(X)[0][1]  # probabilidad de Alzheimer
+    pred = 1 if proba >= 0.5 else 0
 
-    result = "🧠 ALTO RIESGO DE ALZHEIMER" if pred == 1 else "✅ BAJO RIESGO DE ALZHEIMER"
+    if proba < 0.30:
+        result = "✅ Riesgo bajo de Alzheimer"
+        advice = "No se detectan indicadores significativos. Se recomienda control periódico."
+    elif proba < 0.60:
+        result = "🟡 Riesgo moderado de Alzheimer"
+        advice = "Se sugiere seguimiento clínico y evaluación cognitiva."
+    else:
+        result = "🔴 Riesgo alto de Alzheimer"
+        advice = "Se recomienda evaluación médica especializada."
 
-    return templates.TemplateResponse("index.html",
-        {"request": request, "result": result}
+    confidence = round(proba * 100, 2)
+    form_data = data.to_dict(orient="records")[0]
+
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "result": result,
+            "advice": advice,
+            "confidence": confidence,
+            "X_prep": X_list,
+            "predicted_label": int(pred),
+            "confirmed": False,
+             "form_data": form_data  
+        }
     )
+
+
+
+@app.post("/confirm", response_class=HTMLResponse)
+async def confirm_case(request: Request):
+    form = await request.form()
+
+    X_prep = np.array(eval(form["X_prep"])).reshape(1, -1)
+    predicted_label = int(form["predicted_label"])
+    action = form.get("action")
+
+    if action == "correct":
+        true_label = predicted_label
+    else:
+        true_label = int(form["true_label"])
+
+    try:
+        msg = handle_new_patient(
+            X_new_prep=X_prep,
+            y_new=[true_label]
+        )
+        notify = f"{msg}"
+    except Exception as e:
+        notify = f"Error al guardar caso: {e}"
+
+    # Redirect to home so only the form is shown; add a short message in query params
+    qs = urllib.parse.urlencode({"msg": notify})
+    return RedirectResponse(url=f"/?{qs}", status_code=303)
+
+
